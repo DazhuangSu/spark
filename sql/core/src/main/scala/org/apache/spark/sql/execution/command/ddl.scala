@@ -32,7 +32,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{NoSuchTableException, Resolver}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, PredicateHelper}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation, PartitioningUtils}
 import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
@@ -40,6 +40,7 @@ import org.apache.spark.sql.execution.datasources.parquet.ParquetSchemaConverter
 import org.apache.spark.sql.internal.HiveSerDe
 import org.apache.spark.sql.types._
 import org.apache.spark.util.{SerializableConfiguration, ThreadUtils}
+
 
 // Note: The definition of these commands are based on the ones described in
 // https://cwiki.apache.org/confluence/display/Hive/LanguageManual+DDL
@@ -514,18 +515,36 @@ case class AlterTableRenamePartitionCommand(
  * }}}
  */
 case class AlterTableDropPartitionCommand(
-    tableName: TableIdentifier,
-    specs: Seq[TablePartitionSpec],
-    ifExists: Boolean,
-    purge: Boolean,
-    retainData: Boolean)
-  extends RunnableCommand {
+     tableName: TableIdentifier,
+     specs: Seq[TablePartitionSpec],
+     exprs: Seq[Expression] = Seq.empty[Expression],
+     ifExists: Boolean,
+     purge: Boolean,
+     retainData: Boolean)
+  extends RunnableCommand with PredicateHelper {
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
     val catalog = sparkSession.sessionState.catalog
     val table = catalog.getTableMetadata(tableName)
+    val resolver = sparkSession.sessionState.conf.resolver
     DDLUtils.verifyAlterTableType(catalog, table, isView = false)
     DDLUtils.verifyPartitionProviderIsHive(sparkSession, table, "ALTER TABLE DROP PARTITION")
+
+    exprs.foreach { expr =>
+      expr.references.foreach { attr =>
+        if (!table.partitionColumnNames.exists(resolver(_, attr.name))) {
+          throw new AnalysisException(s"${attr.name} is not a valid partition column " + s"in table ${table.identifier.quotedString}.")
+        }
+      }
+    }
+
+    val partitionSet = exprs.flatMap { expr =>
+      val partitions = catalog.listPartitionsByFilter(table.identifier, Seq(expr)).map(_.spec)
+      if (partitions.isEmpty && !ifExists) {
+        throw new AnalysisException(s"There is no partition for ${expr.sql}")
+      }
+      partitions
+    }.distinct
 
     val normalizedSpecs = specs.map { spec =>
       PartitioningUtils.normalizePartitionSpec(
@@ -533,10 +552,26 @@ case class AlterTableDropPartitionCommand(
         table.partitionColumnNames,
         table.identifier.quotedString,
         sparkSession.sessionState.conf.resolver)
+    }.filter(_.size != 0)
+
+    val toDrop = {
+      if (normalizedSpecs.isEmpty && partitionSet.isEmpty) {
+        println("dazhuang.su test: 1")
+        Seq.empty[TablePartitionSpec]
+      } else if (normalizedSpecs.isEmpty && !partitionSet.isEmpty) {
+        println("dazhuang.su test: 2")
+        partitionSet
+      } else if (!normalizedSpecs.isEmpty && partitionSet.isEmpty) {
+        println("dazhuang.su test: 3")
+        normalizedSpecs
+      } else {
+        println("dazhuang.su test: 4")
+        partitionSet.intersect(normalizedSpecs)
+      }
     }
 
     catalog.dropPartitions(
-      table.identifier, normalizedSpecs, ignoreIfNotExists = ifExists, purge = purge,
+      table.identifier, toDrop, ignoreIfNotExists = ifExists, purge = purge,
       retainData = retainData)
 
     CommandUtils.updateTableStats(sparkSession, table)
